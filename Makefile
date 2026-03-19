@@ -1,24 +1,31 @@
-CC       = gcc
-CFLAGS   = -Wall -pthread
-LIB_SRC  = caesar.c
-LIB      = libcaesar.so
-BIN      = secure_copy
+CC = gcc
+CFLAGS = -Wall -pthread
+LDFLAGS = -Wl,-rpath,. -L. -lcaesar
+TARGET = secure_copy
+LIB_TARGET = libcaesar.so
+OBJS = secure_copy.o
 
-all: $(LIB) $(BIN)
+all: $(LIB_TARGET) $(TARGET)
 
-$(LIB): $(LIB_SRC)
-	$(CC) -fPIC -shared -o $@ $<
+$(LIB_TARGET): caesar.c caesar.h
+	$(CC) -shared -fPIC caesar.c -o $(LIB_TARGET)
 
-$(BIN): secure_copy.c
-	$(CC) $(CFLAGS) -o $@ $< -ldl -lrt
+$(TARGET): $(OBJS) $(LIB_TARGET)
+	$(CC) $(OBJS) -o $(TARGET) $(CFLAGS) $(LDFLAGS)
+
+secure_copy.o: secure_copy.c caesar.h
+	$(CC) $(CFLAGS) -c secure_copy.c -o secure_copy.o
 
 clean:
-	rm -f $(LIB) $(BIN) large_input.txt enc.txt dec.txt
+	rm -f $(OBJS) $(TARGET) $(LIB_TARGET)
+	rm -rf outdir/
 
-test: all
-	dd if=/dev/urandom of=large_input.txt bs=15M count=10 2>/dev/null
-	./$(BIN) large_input.txt enc.txt K
-	./$(BIN) enc.txt dec.txt K
-	diff large_input.txt dec.txt && echo "Test PASSED" || echo "Test FAILED"
+run:
+	./$(TARGET) f1.txt f2.txt f3.txt f4.txt f5.txt outdir/ X
 
-.PHONY: all clean test
+files:
+	printf "Hello World 1" > f1.txt
+	printf "Hello World 2" > f2.txt
+	printf "Hello World 3" > f3.txt
+	printf "Hello World 4" > f4.txt
+	printf "Hello World 5" > f5.txt
