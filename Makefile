@@ -1,31 +1,37 @@
 CC = gcc
 CFLAGS = -Wall -pthread
 LDFLAGS = -Wl,-rpath,. -L. -lcaesar
+
 TARGET = secure_copy
-LIB_TARGET = libcaesar.so
-OBJS = secure_copy.o
+LIB = libcaesar.so
 
-all: $(LIB_TARGET) $(TARGET)
+all: $(LIB) $(TARGET)
 
-$(LIB_TARGET): caesar.c caesar.h
-	$(CC) -shared -fPIC caesar.c -o $(LIB_TARGET)
+$(LIB): caesar.c caesar.h
+	$(CC) -shared -fPIC caesar.c -o $(LIB)
 
-$(TARGET): $(OBJS) $(LIB_TARGET)
-	$(CC) $(OBJS) -o $(TARGET) $(CFLAGS) $(LDFLAGS)
+$(TARGET): secure_copy.o $(LIB)
+	$(CC) secure_copy.o -o $(TARGET) $(CFLAGS) $(LDFLAGS)
 
 secure_copy.o: secure_copy.c caesar.h
-	$(CC) $(CFLAGS) -c secure_copy.c -o secure_copy.o
+	$(CC) $(CFLAGS) -c secure_copy.c
 
 clean:
-	rm -f $(OBJS) $(TARGET) $(LIB_TARGET)
-	rm -rf outdir/
+	rm -f *.o $(TARGET) $(LIB)
+	rm -rf outdir log.txt
 
 run:
-	./$(TARGET) f1.txt f2.txt f3.txt f4.txt f5.txt outdir/ X
+	./$(TARGET) f1.txt f2.txt f3.txt f4.txt f5.txt outdir X
+
+run_seq:
+	./$(TARGET) --mode=sequential f1.txt f2.txt f3.txt outdir X
+
+run_par:
+	./$(TARGET) --mode=parallel f1.txt f2.txt f3.txt f4.txt f5.txt outdir X
 
 files:
-	printf "Hello World 1" > f1.txt
-	printf "Hello World 2" > f2.txt
-	printf "Hello World 3" > f3.txt
-	printf "Hello World 4" > f4.txt
-	printf "Hello World 5" > f5.txt
+	printf "Hello 1" > f1.txt
+	printf "Hello 2" > f2.txt
+	printf "Hello 3" > f3.txt
+	printf "Hello 4" > f4.txt
+	printf "Hello 5" > f5.txt
