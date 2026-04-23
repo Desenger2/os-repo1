@@ -32,6 +32,28 @@ struct thread_data {
     pthread_t thread_id;
 };
 
+int check_output_dir_access(const char* dir_path) {
+    struct stat st;
+    
+    if (stat(dir_path, &st) == -1) {
+        if (mkdir(dir_path, 0700) == -1) {
+            fprintf(stderr, "Error: Cannot create or access directory '%s'\n", dir_path);
+            return -1;
+        }
+    } else {
+        if (access(dir_path, W_OK) == -1) {
+            fprintf(stderr, "Error: Cannot write to directory '%s'\n", dir_path);
+            return -1;
+        }
+        if (!S_ISDIR(st.st_mode)) {
+            fprintf(stderr, "Error: '%s' is not a directory\n", dir_path);
+            return -1;
+        }
+    }
+    
+    return 0;
+}
+
 void write_log(const char* filename, const char* status, double elapsed_time, pthread_t thread_id) {
     time_t raw_time;
     struct tm* time_info;
@@ -225,6 +247,10 @@ int main(int argc, char* argv[]) {
         mkdir(global_output_dir, 0700);
     }
     
+    if (check_output_dir_access(global_output_dir) == -1) {
+        return 1;
+    }
+
     log_file = fopen("log.txt", "a");
     if (log_file == NULL) {
         printf("Error: cannot create log.txt\n");
