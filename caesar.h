@@ -5,5 +5,7 @@
 
 void set_key(char key);
 void caesar(void* src, void* dst, int len);
+void destroy_key(void);
+char* get_key_ptr(void);
 
 #endif

@@ -29,6 +29,9 @@ run_seq:
 run_par:
 	./$(TARGET) --mode=parallel f1.txt f2.txt f3.txt f4.txt f5.txt outdir X
 
+run_demo:
+	./$(TARGET) --demo-write f1.txt outdir X
+
 files:
 	printf "Hello 1" > f1.txt
 	printf "Hello 2" > f2.txt

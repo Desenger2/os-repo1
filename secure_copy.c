@@ -8,6 +8,7 @@
 #include <sys/types.h>
 #include <errno.h>
 #include <time.h>
+#include <signal.h>
 
 #include "caesar.h"
 
@@ -17,6 +18,8 @@
 #ifndef WORKERS_COUNT
 #define WORKERS_COUNT NUM_THREADS
 #endif
+
+#define CHUNK_SIZE 65536
 
 pthread_mutex_t counter_mutex = PTHREAD_MUTEX_INITIALIZER;
 pthread_mutex_t log_mutex = PTHREAD_MUTEX_INITIALIZER;
@@ -159,8 +162,8 @@ void* process_files(void* arg) {
             continue;
         }
         
-        caesar(buffer, encrypted, file_size);
-        
+        long chunk_size = CHUNK_SIZE;
+
         FILE* out = fopen(output_path, "wb");
         if (out == NULL) {
             snprintf(status, sizeof(status), "error: cannot create output file");
@@ -169,11 +172,19 @@ void* process_files(void* arg) {
             free(encrypted);
             continue;
         }
-        
-        size_t bytes_written = fwrite(encrypted, 1, file_size, out);
+
+        int io_error = 0;
+        for (long off = 0; off < file_size; off += chunk_size) {
+            long n = (off + chunk_size > file_size) ? (file_size - off) : chunk_size;
+            caesar(buffer + off, encrypted + off, n);
+            if (fwrite(encrypted + off, 1, n, out) != (size_t)n) {
+                io_error = 1;
+                break;
+            }
+        }
         fclose(out);
-        
-        if (bytes_written != file_size) {
+
+        if (io_error) {
             snprintf(status, sizeof(status), "error: cannot write file");
             write_log(input_file, status, 0, thread_id);
             free(buffer);
@@ -222,19 +233,45 @@ double run_threads(int num_threads) {
            (e.tv_nsec - s.tv_nsec) / 1e9;
 }
 
+void sigsegv_handler(int sig, siginfo_t* info, void* context) {
+    (void)sig; (void)info; (void)context;
+    const char msg[] = "Security error: attempt to modify protected key memory\n";
+    write(STDERR_FILENO, msg, sizeof(msg) - 1);
+    _exit(2);
+}
+
+void demo_write_attempt(void) {
+    char* k = get_key_ptr();
+    if (k == NULL) return;
+    printf("Demonstrating write attempt to protected memory...\n");
+    fflush(stdout);
+    k[0] = 'Z';
+}
+
 int main(int argc, char* argv[]) {
     if (argc < 4) {
         printf("Usage: %s [--mode=sequential|parallel] file1 ... output_dir key\n", argv[0]);
         return 1;
     }
 
+    struct sigaction sa;
+    sa.sa_sigaction = sigsegv_handler;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = SA_SIGINFO | SA_RESETHAND;
+    if (sigaction(SIGSEGV, &sa, NULL) == -1) {
+        perror("sigaction");
+        return 1;
+    }
+
     int mode = 0; // auto
     int arg_shift = 1;
+    int demo_write = 0;
 
-    if (strncmp(argv[1], "--mode=", 7) == 0) {
-        if (strcmp(argv[1], "--mode=sequential") == 0) mode = 1;
-        else if (strcmp(argv[1], "--mode=parallel") == 0) mode = 2;
-        arg_shift = 2;
+    while (arg_shift < argc && strncmp(argv[arg_shift], "--", 2) == 0) {
+        if (strcmp(argv[arg_shift], "--mode=sequential") == 0) { mode = 1; arg_shift++; }
+        else if (strcmp(argv[arg_shift], "--mode=parallel") == 0) { mode = 2; arg_shift++; }
+        else if (strcmp(argv[arg_shift], "--demo-write") == 0) { demo_write = 1; arg_shift++; }
+        else break;
     }
     
     char key = argv[argc - 1][0];
@@ -292,5 +329,11 @@ int main(int argc, char* argv[]) {
     printf("avg  : %.6f sec/file\n", avg_alt);
 
     fclose(log_file);
+
+    if (demo_write) {
+        demo_write_attempt();
+    }
+
+    destroy_key();
     return 0;
 }
