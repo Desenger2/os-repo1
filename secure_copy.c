@@ -19,15 +19,20 @@
 #define SALT_SIZE 16
 #define TIMEOUT_SEC 5
 
+#define MAX_FILE_SIZE 0xFFFFFFFFULL
+#define MAX_NAME_LEN  0xFFFFFFFFULL
+
 #ifndef CHUNK_SIZE
 #define CHUNK_SIZE (4 * 1024 * 1024)
 #endif
 
 pthread_mutex_t counter_mutex = PTHREAD_MUTEX_INITIALIZER;
 pthread_mutex_t log_mutex = PTHREAD_MUTEX_INITIALIZER;
+pthread_mutex_t error_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 int files_copied = 0;
 int total_files = 0;
+int global_had_error = 0;
 char** global_file_list = NULL;
 char** global_name_list = NULL;
 long long* global_offsets = NULL;
@@ -106,6 +111,24 @@ int read_u32_le(FILE* f, uint32_t* v) {
     return 0;
 }
 
+FILE* open_image_ro(const char* image) {
+    struct stat st;
+    if (stat(image, &st) == -1) {
+        fprintf(stderr, "Error: cannot open image '%s': %s\n", image, strerror(errno));
+        return NULL;
+    }
+    if (!S_ISREG(st.st_mode)) {
+        fprintf(stderr, "Error: '%s' is not a regular file\n", image);
+        return NULL;
+    }
+    FILE* f = fopen(image, "rb");
+    if (f == NULL) {
+        fprintf(stderr, "Error: cannot open image '%s': %s\n", image, strerror(errno));
+        return NULL;
+    }
+    return f;
+}
+
 int image_contains_name(const char* image_path, const char* target_name) {
     FILE* f = fopen(image_path, "rb");
     if (f == NULL) return 0;
@@ -136,6 +159,12 @@ int image_contains_name(const char* image_path, const char* target_name) {
     return found;
 }
 
+void mark_error(void) {
+    pthread_mutex_lock(&error_mutex);
+    global_had_error = 1;
+    pthread_mutex_unlock(&error_mutex);
+}
+
 void* process_files(void* arg) {
     struct thread_data* data = (struct thread_data*)arg;
     pthread_t thread_id = pthread_self();
@@ -145,6 +174,7 @@ void* process_files(void* arg) {
     unsigned char* outbuf = malloc(CHUNK_SIZE);
     if (inbuf == NULL || outbuf == NULL) {
         free(inbuf); free(outbuf); free(data);
+        mark_error();
         return NULL;
     }
 
@@ -165,6 +195,7 @@ void* process_files(void* arg) {
         if (in == NULL) {
             snprintf(status, sizeof(status), "error: cannot open input file");
             write_log(input_file, status, 0, thread_id);
+            mark_error();
             continue;
         }
 
@@ -173,6 +204,7 @@ void* process_files(void* arg) {
             snprintf(status, sizeof(status), "error: cannot generate salt");
             write_log(input_file, status, 0, thread_id);
             fclose(in);
+            mark_error();
             continue;
         }
 
@@ -183,6 +215,7 @@ void* process_files(void* arg) {
             snprintf(status, sizeof(status), "error: cannot allocate memory");
             write_log(input_file, status, 0, thread_id);
             fclose(in);
+            mark_error();
             continue;
         }
         uint32_t fs32 = (uint32_t)file_size;
@@ -201,6 +234,7 @@ void* process_files(void* arg) {
             snprintf(status, sizeof(status), "error: cannot write image header");
             write_log(input_file, status, 0, thread_id);
             fclose(in);
+            mark_error();
             continue;
         }
 
@@ -209,6 +243,7 @@ void* process_files(void* arg) {
             snprintf(status, sizeof(status), "error: cannot init cipher");
             write_log(input_file, status, 0, thread_id);
             fclose(in);
+            mark_error();
             continue;
         }
 
@@ -230,6 +265,7 @@ void* process_files(void* arg) {
         if (io_error) {
             snprintf(status, sizeof(status), "error: cannot read/write file");
             write_log(input_file, status, 0, thread_id);
+            mark_error();
             continue;
         }
 
@@ -394,15 +430,36 @@ int cmd_add(int argc, char* argv[]) {
 
     int wcount = 0;
     for (int k = 0; k < count; k++) {
-        int dup = 0;
-        if (image_contains_name(image, names[k])) dup = 1;
-        for (int m = 0; !dup && m < wcount; m++) {
-            if (strcmp(names[m], names[k]) == 0) dup = 1;
+        int skip = 0;
+        const char* reason = NULL;
+
+        struct stat fst;
+        if (stat(files[k], &fst) == 0 && S_ISREG(fst.st_mode)) {
+            if ((unsigned long long)fst.st_size > MAX_FILE_SIZE) {
+                skip = 1;
+                reason = "skipped: file too large (max 4 GiB)";
+                fprintf(stderr, "Error: '%s' exceeds maximum file size (4 GiB), skipped\n", files[k]);
+            }
         }
-        if (dup) {
-            if (log_file != NULL) {
+        if (!skip && (unsigned long long)strlen(names[k]) > MAX_NAME_LEN) {
+            skip = 1;
+            reason = "skipped: name too long";
+            fprintf(stderr, "Error: name for '%s' too long, skipped\n", files[k]);
+        }
+
+        int dup = 0;
+        if (!skip) {
+            if (image_contains_name(image, names[k])) dup = 1;
+            for (int m = 0; !dup && m < wcount; m++) {
+                if (strcmp(names[m], names[k]) == 0) dup = 1;
+            }
+            if (dup) reason = "skipped: duplicate name";
+        }
+
+        if (skip || dup) {
+            if (log_file != NULL && reason != NULL) {
                 pthread_mutex_lock(&log_mutex);
-                fprintf(log_file, "File: %s, Status: skipped: duplicate name\n", files[k]);
+                fprintf(log_file, "File: %s, Status: %s\n", files[k], reason);
                 fflush(log_file);
                 pthread_mutex_unlock(&log_mutex);
             }
@@ -419,7 +476,7 @@ int cmd_add(int argc, char* argv[]) {
     count = wcount;
 
     if (count == 0) {
-        fprintf(stderr, "Error: no files to add (all duplicates)\n");
+        fprintf(stderr, "Error: no files to add (all skipped)\n");
         free(files); free(names);
         if (log_file != NULL) fclose(log_file);
         return 1;
@@ -428,6 +485,15 @@ int cmd_add(int argc, char* argv[]) {
     int fd = open(image, O_RDWR | O_CREAT, 0600);
     if (fd == -1) {
         fprintf(stderr, "Error: cannot open image '%s': %s\n", image, strerror(errno));
+        for (int k = 0; k < count; k++) { free(files[k]); free(names[k]); }
+        free(files); free(names);
+        if (log_file != NULL) fclose(log_file);
+        return 1;
+    }
+    struct stat img_st;
+    if (fstat(fd, &img_st) == -1 || !S_ISREG(img_st.st_mode)) {
+        fprintf(stderr, "Error: '%s' is not a regular file\n", image);
+        close(fd);
         for (int k = 0; k < count; k++) { free(files[k]); free(names[k]); }
         free(files); free(names);
         if (log_file != NULL) fclose(log_file);
@@ -484,8 +550,25 @@ int cmd_add(int argc, char* argv[]) {
     wipe_str((char*)key);
     key = NULL;
 
+    global_had_error = 0;
+
     int threads = (count < 2) ? 1 : MAX_THREADS;
     double elapsed = run_threads(threads);
+
+    int rolled_back = 0;
+    if (global_had_error) {
+        if (ftruncate(fd, image_end) == 0) {
+            rolled_back = 1;
+        }
+        fprintf(stderr, "Error: one or more files failed; image rolled back to previous state\n");
+        if (log_file != NULL) {
+            pthread_mutex_lock(&log_mutex);
+            fprintf(log_file, "Status: transaction failed, image %s\n",
+                    rolled_back ? "rolled back" : "ROLLBACK FAILED");
+            fflush(log_file);
+            pthread_mutex_unlock(&log_mutex);
+        }
+    }
 
     double avg = count ? elapsed / count : 0;
     printf("mode: %s\n", threads == 1 ? "sequential" : "parallel");
@@ -505,7 +588,7 @@ int cmd_add(int argc, char* argv[]) {
 
     destroy_key();
     if (log_file != NULL) fclose(log_file);
-    return 0;
+    return global_had_error ? 1 : 0;
 }
 
 int cmd_list(int argc, char* argv[]) {
@@ -519,9 +602,8 @@ int cmd_list(int argc, char* argv[]) {
         fprintf(stderr, "Usage: %s -list -image IMAGE\n", argv[0]);
         return 1;
     }
-    FILE* f = fopen(image, "rb");
+    FILE* f = open_image_ro(image);
     if (f == NULL) {
-        fprintf(stderr, "Error: cannot open image '%s': %s\n", image, strerror(errno));
         return 1;
     }
 
@@ -596,9 +678,8 @@ int cmd_get(int argc, char* argv[]) {
         return 1;
     }
 
-    FILE* f = fopen(image, "rb");
+    FILE* f = open_image_ro(image);
     if (f == NULL) {
-        fprintf(stderr, "Error: cannot open image '%s': %s\n", image, strerror(errno));
         return 1;
     }
 
@@ -610,6 +691,7 @@ int cmd_get(int argc, char* argv[]) {
     wipe_str((char*)key);
     key = NULL;
     int rc = 1;
+    int found = 0;
 
     while (1) {
         uint32_t fsize, nlen;
@@ -624,6 +706,7 @@ int cmd_get(int argc, char* argv[]) {
 
         if (strcmp(name, target_name) == 0) {
             free(name);
+            found = 1;
             FILE* out = fopen(out_path, "wb");
             if (out == NULL) {
                 fprintf(stderr, "Error: cannot create output '%s': %s\n", out_path, strerror(errno));
@@ -675,34 +758,22 @@ int cmd_get(int argc, char* argv[]) {
     }
     fclose(f);
     destroy_key();
-    if (rc != 0) {
+    if (!found) {
         fprintf(stderr, "Error: file '%s' not found in image\n", target_name);
     }
     return rc;
 }
 
-static void* demo_region_start = NULL;
-static size_t demo_region_size = 0;
-
 void sigsegv_handler(int sig, siginfo_t* info, void* context) {
-    (void)context;
-    if (demo_region_start != NULL &&
-        info->si_addr >= demo_region_start &&
-        (char*)info->si_addr < (char*)demo_region_start + demo_region_size) {
-        const char msg[] = "Security error: attempt to access protected key memory\n";
-        write(STDERR_FILENO, msg, sizeof(msg) - 1);
-        _exit(2);
-    }
-    signal(sig, SIG_DFL);
-    raise(sig);
+    (void)sig; (void)info; (void)context;
+    const char msg[] = "Security error: attempt to modify protected key memory\n";
+    write(STDERR_FILENO, msg, sizeof(msg) - 1);
+    _exit(2);
 }
 
 void demo_write_attempt(void) {
     char* k = get_key_ptr();
-    if (k == NULL) {
-        fprintf(stderr, "No key is set\n");
-        return;
-    }
+    if (k == NULL) return;
     printf("Demonstrating write attempt to protected memory...\n");
     fflush(stdout);
     k[0] = 'Z';
@@ -729,11 +800,6 @@ int cmd_demo(int argc, char* argv[]) {
     }
     wipe_str((char*)key);
     key = NULL;
-
-    long ps = sysconf(_SC_PAGESIZE);
-    if (ps <= 0) ps = 4096;
-    demo_region_start = get_key_ptr();
-    demo_region_size = (size_t)ps;
 
     struct sigaction sa;
     sa.sa_sigaction = sigsegv_handler;
